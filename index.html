@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#17231f">
+    <meta name="color-scheme" content="light">
+    <meta name="referrer" content="no-referrer">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self'; form-action 'none'; img-src 'self' blob: data:; object-src 'none'; script-src 'self'; style-src 'self'">
+    <title>FrameRinse — clean a photo before you post</title>
+    <meta name="description" content="Remove common photo metadata, resize, and cover visible details without uploading the original.">
+    <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+    <script type="module" src="src/app.js"></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="FrameRinse home">
+        <img src="icons/icon.svg" alt="" width="38" height="38">
+        <span>FrameRinse</span>
+      </a>
+      <div class="local-badge"><span aria-hidden="true"></span><b>Self-hosted</b></div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">Your server does the work</p>
+        <h1 id="page-title">Leave the photo.<br><span>Lose the trail.</span></h1>
+        <p class="hero-copy">Upload over your own network. FrameRinse makes the preview and cleaned copy on your server, so your phone does not decode the full original.</p>
+        <div class="trust-row" aria-label="Privacy properties">
+          <span>No third parties</span>
+          <span>Server-side processing</span>
+          <span>Automatic cleanup</span>
+        </div>
+      </section>
+
+      <section class="work-card upload-card" aria-labelledby="upload-heading">
+        <div class="step-heading">
+          <span class="step-number">01</span>
+          <div>
+            <p class="kicker">Choose locally</p>
+            <h2 id="upload-heading">Pick one photo</h2>
+          </div>
+        </div>
+
+        <label id="dropZone" class="drop-zone" for="fileInput">
+          <input id="fileInput" class="visually-hidden" type="file" accept="image/*">
+          <span class="upload-mark" aria-hidden="true">+</span>
+          <strong>Choose a photo</strong>
+          <span>Photo Library, Files, camera, or drag and drop</span>
+          <small>Photos up to 100 MB / 100 megapixels</small>
+        </label>
+        <p id="uploadStatus" class="status-line" role="status" aria-live="polite">The original is stored temporarily on your FrameRinse server.</p>
+      </section>
+
+      <section id="editorSection" class="work-card editor-card" aria-labelledby="editor-heading" hidden>
+        <div class="step-heading">
+          <span class="step-number">02</span>
+          <div>
+            <p class="kicker">Review and reduce</p>
+            <h2 id="editor-heading">Cover what metadata cannot</h2>
+          </div>
+        </div>
+
+        <div class="source-summary">
+          <div>
+            <span>Source</span>
+            <strong id="sourceFacts">—</strong>
+          </div>
+          <div>
+            <span>Input scan</span>
+            <strong id="inputScan">—</strong>
+          </div>
+        </div>
+
+        <div class="preview-shell">
+          <div id="canvasStage" class="canvas-stage">
+            <canvas id="previewCanvas"></canvas>
+            <canvas id="coverCanvas" role="application" tabindex="0" aria-describedby="coverHint keyboardHint" aria-label="Photo cover editor"></canvas>
+          </div>
+          <p id="coverHint" class="cover-hint"><span aria-hidden="true">↗</span> Drag over a face, address, document, screen, reflection, tattoo, or other visible clue.</p>
+          <p id="keyboardHint" class="keyboard-hint">Keyboard: focus the photo, press Enter to add a cover, use arrows to move, +/− to resize, and Delete to remove.</p>
+          <div class="cover-actions">
+            <span id="coverCount" aria-live="polite">No covers added</span>
+            <button id="undoCover" class="text-button" type="button" disabled>Undo last</button>
+            <button id="clearCovers" class="text-button" type="button" disabled>Clear covers</button>
+          </div>
+        </div>
+
+        <div class="settings-grid">
+          <label>
+            <span>Output format</span>
+            <select id="formatSelect">
+              <option value="jpeg">JPEG — most compatible</option>
+              <option value="png">PNG — lossless</option>
+              <option value="webp">WebP — smaller</option>
+            </select>
+          </label>
+          <label>
+            <span>Long edge</span>
+            <select id="maxEdgeSelect">
+              <option value="1080">1080 px — social post</option>
+              <option value="2048" selected>2048 px — recommended</option>
+              <option value="4096">4096 px — high detail</option>
+            </select>
+          </label>
+          <label id="qualityField" class="quality-field">
+            <span>Quality <output id="qualityOutput" for="qualityRange">90%</output></span>
+            <input id="qualityRange" type="range" min="65" max="100" value="90" step="1">
+          </label>
+        </div>
+
+        <div class="scrub-row">
+          <div>
+            <strong>Your server handles the heavy work</strong>
+            <span>The phone sends only cover coordinates and export settings after upload.</span>
+          </div>
+          <button id="scrubButton" class="primary-button" type="button">Scrub photo</button>
+        </div>
+        <p id="editorStatus" class="status-line" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="outputSection" class="work-card output-card" aria-labelledby="output-heading" hidden>
+        <div class="step-heading">
+          <span class="step-number complete" aria-hidden="true">✓</span>
+          <div>
+            <p class="kicker">New copy ready</p>
+            <h2 id="output-heading">Checked before sharing</h2>
+          </div>
+        </div>
+
+        <div class="output-layout">
+          <img id="outputPreview" alt="Scrubbed photo preview">
+          <ul id="outputReport" class="output-report"></ul>
+        </div>
+
+        <div class="output-actions">
+          <button id="shareButton" class="primary-button share-button" type="button">Open to save to Photos</button>
+          <button id="downloadButton" class="secondary-button" type="button">Download</button>
+          <button id="resetButton" class="text-button reset-button" type="button">Clear everything</button>
+        </div>
+        <p id="outputStatus" class="status-line" role="status" aria-live="polite">On iPhone, open the image, press and hold it, then choose <strong>Save to Photos</strong>.</p>
+      </section>
+
+      <aside class="reality-check" aria-labelledby="reality-heading">
+        <p class="eyebrow">Before you publish</p>
+        <h2 id="reality-heading">Metadata is only one trail.</h2>
+        <div class="check-grid">
+          <p><strong>Look at the pixels</strong><span>Faces, reflections, windows, mail, landmarks, screens, tattoos, and uniforms can identify you.</span></p>
+          <p><strong>Break the timing pattern</strong><span>Posting later can reveal less about where you are right now or what your routine looks like.</span></p>
+          <p><strong>Separate the account</strong><span>A dedicated email, careful recovery details, and different handles reduce accidental account linking.</span></p>
+        </div>
+        <p class="honesty-note">FrameRinse reduces accidental disclosure. It cannot promise anonymity or control what a social platform learns after upload.</p>
+      </aside>
+    </main>
+
+    <footer>
+      <p><strong>FrameRinse</strong> — self-hosted photo cleanup.</p>
+      <p id="runtimeNote">App loaded. No photo selected.</p>
+    </footer>
+  </body>
+</html>

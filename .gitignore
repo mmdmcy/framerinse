@@ -1,0 +1,30 @@
+# Dependencies and generated output
+node_modules/
+coverage/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+id_ed25519
+id_rsa
+
+# Private agent and workspace state
+AGENTS.md
+.codex/
+.claude/
+private/
+docs/private/
+state/
+uploads/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Tooling and operating systems
+target/
+.DS_Store

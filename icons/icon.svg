@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="FrameRinse shield and picture icon">
+  <rect width="512" height="512" rx="112" fill="#17231f"/>
+  <path d="M256 66 423 128v119c0 107-67 169-167 201-100-32-167-94-167-201V128l167-62Z" fill="#d9ff67"/>
+  <rect x="145" y="153" width="222" height="176" rx="24" fill="#17231f"/>
+  <circle cx="203" cy="208" r="25" fill="#d9ff67"/>
+  <path d="m163 300 65-66 43 42 31-31 47 55H163Z" fill="#d9ff67"/>
+  <path d="M172 371h168" fill="none" stroke="#17231f" stroke-linecap="round" stroke-width="24"/>
+</svg>
