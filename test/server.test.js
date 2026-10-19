@@ -3,12 +3,12 @@ import { stat } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import test from 'node:test';
 
 import sharp from 'sharp';
 
-import { createFrameRinseServer, parseOptions, publicFiles, securityHeaders } from '../server.mjs';
+import { createFrameRinseServer, defaultDataDir, parseOptions, publicFiles, securityHeaders } from '../server.mjs';
 import { inspectImageMetadata } from '../src/metadata.js';
 
 async function withServer(run, options = {}) {
@@ -97,13 +97,19 @@ async function createJob(baseUrl) {
   return { body: await response.json(), response, source };
 }
 
-test('defaults to plain HTTP LAN hosting and temporary SQLite state', () => {
+test('defaults to plain HTTP LAN hosting and per-user SQLite state', () => {
   const options = parseOptions([], {});
   assert.equal(options.host, '0.0.0.0');
   assert.equal(options.port, 4173);
   assert.equal(options.ttlMinutes, 60);
-  assert.equal(options.dataDir, path.join(tmpdir(), 'framerinse'));
+  assert.equal(options.maxTotalBytes, 2 * 1024 * 1024 * 1024);
+  assert.equal(options.dataDir, defaultDataDir({}));
+  assert.equal(options.dataDir.startsWith(path.join(tmpdir(), 'framerinse')), false);
+  assert.equal(defaultDataDir({ XDG_STATE_HOME: '/state' }), path.join('/state', 'framerinse'));
   assert.equal(parseOptions(['--host', '127.0.0.1', '--port', '8123', '--data-dir', '/tmp/p'], {}).host, '127.0.0.1');
+  assert.equal(parseOptions(['--max-total-mb', '5'], {}).maxTotalBytes, 5 * 1024 * 1024);
+  assert.equal(parseOptions([], { FRAMERINSE_MAX_TOTAL_MB: '7' }).maxTotalBytes, 7 * 1024 * 1024);
+  assert.throws(() => parseOptions(['--max-total-mb', '0'], {}), /Total storage limit/);
   assert.throws(() => parseOptions(['--port', '70000'], {}), /Port must be/);
   assert.throws(() => parseOptions(['--unknown'], {}), /Unknown option/);
 });
@@ -222,6 +228,82 @@ test('rejects invalid image uploads and unsafe scrub settings', async () => {
     });
     assert.equal(invalidCover.status, 400);
   });
+});
+
+test('refuses cross-site browser requests and non-image upload bodies', async () => {
+  await withServer(async (baseUrl, port) => {
+    const source = await sourceJpeg();
+    const crossSite = await fetch(`${baseUrl}/api/jobs`, {
+      body: source,
+      headers: { 'Content-Type': 'image/jpeg', 'Sec-Fetch-Site': 'cross-site' },
+      method: 'POST',
+    });
+    assert.equal(crossSite.status, 403);
+    const foreignOrigin = await fetch(`${baseUrl}/api/jobs`, {
+      body: source,
+      headers: { 'Content-Type': 'image/jpeg', Origin: 'http://evil.example' },
+      method: 'POST',
+    });
+    assert.equal(foreignOrigin.status, 403);
+    const nullOrigin = await fetch(`${baseUrl}/api/jobs`, {
+      body: source,
+      headers: { 'Content-Type': 'image/jpeg', Origin: 'null' },
+      method: 'POST',
+    });
+    assert.equal(nullOrigin.status, 403);
+    const textPlain = await fetch(`${baseUrl}/api/jobs`, {
+      body: source,
+      headers: { 'Content-Type': 'text/plain' },
+      method: 'POST',
+    });
+    assert.equal(textPlain.status, 415);
+
+    const sameOrigin = await fetch(`${baseUrl}/api/jobs`, {
+      body: source,
+      headers: { 'Content-Type': 'image/jpeg', Origin: `http://127.0.0.1:${port}`, 'Sec-Fetch-Site': 'same-origin' },
+      method: 'POST',
+    });
+    assert.equal(sameOrigin.status, 201);
+    const created = await sameOrigin.json();
+    const crossSiteDelete = await fetch(`${baseUrl}/api/jobs/${created.id}`, {
+      headers: { Origin: 'http://evil.example' },
+      method: 'DELETE',
+    });
+    assert.equal(crossSiteDelete.status, 403);
+    assert.equal((await fetch(`${baseUrl}${created.previewUrl}`)).status, 200);
+  });
+});
+
+test('caps total stored bytes across jobs', async () => {
+  const sourceBytes = (await sourceJpeg()).length;
+  await withServer(
+    async (baseUrl) => {
+      const first = await createJob(baseUrl);
+      assert.equal(first.response.status, 201);
+      const second = await createJob(baseUrl);
+      assert.equal(second.response.status, 507);
+      await fetch(`${baseUrl}/api/jobs/${first.body.id}`, { method: 'DELETE' });
+      const third = await createJob(baseUrl);
+      assert.equal(third.response.status, 201);
+    },
+    // Room for one source plus its preview, not for a second source.
+    { maxTotalBytes: Math.floor(sourceBytes * 1.5) },
+  );
+});
+
+test('tightens a pre-existing data directory to mode 0700', async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'framerinse-mode-'));
+  try {
+    await mkdir(path.join(dataDir, 'jobs'));
+    await chmod(dataDir, 0o755);
+    await chmod(path.join(dataDir, 'jobs'), 0o777);
+    const app = await createFrameRinseServer({ dataDir, ttlMinutes: 5 });
+    app.close();
+    assert.equal((await stat(dataDir)).mode & 0o777, 0o700);
+    assert.equal((await stat(path.join(dataDir, 'jobs'))).mode & 0o777, 0o700);
+  } finally {
+    await rm(dataDir, { force: true, recursive: true });
+  }
 });
 
 test('does not expose server source, database, private state, or path traversal', async () => {

@@ -29,9 +29,18 @@ full image, then choose **Save to Photos**.
 ## Temporary storage
 
 By default, FrameRinse stores its SQLite database and job files under
-`/tmp/framerinse`. A job contains the original, small preview, and latest output.
-Tap **Clear everything** to delete it immediately; otherwise it expires after
-60 minutes.
+`$XDG_STATE_HOME/framerinse` (usually `~/.local/state/framerinse`), created
+with mode `0700`. An existing directory is used only if the current user owns
+it; its mode is tightened to `0700`, and the server refuses to start on a
+directory owned by someone else. A job contains the original, small preview,
+and latest output. Tap **Clear everything** to delete it immediately; otherwise
+it expires after 60 minutes.
+
+Stored job bytes are capped (2 GB by default); uploads beyond the cap get
+`507` until jobs are cleared or expire. Uploads must be sent as `image/*` or
+`application/octet-stream`, and browser requests from another site are refused
+(`403`) based on the `Origin` and `Sec-Fetch-Site` headers. There is still no
+login: anyone on the LAN who can reach the port can use the server.
 
 Configuration:
 
@@ -40,6 +49,7 @@ FRAMERINSE_HOST=0.0.0.0
 FRAMERINSE_PORT=4173
 FRAMERINSE_DATA_DIR=/path/to/private/runtime/storage
 FRAMERINSE_JOB_TTL_MINUTES=60
+FRAMERINSE_MAX_TOTAL_MB=2048
 ```
 
 The server accepts photos up to 100 MB and 100 megapixels. It processes the
