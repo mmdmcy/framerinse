@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, open, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
-import { tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +15,7 @@ import { detectContainer, inspectImageMetadata } from './src/metadata.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_INPUT_PIXELS = 100_000_000;
 const MAX_JSON_BYTES = 64 * 1024;
 const PREVIEW_EDGE = 1400;
@@ -64,8 +65,9 @@ function parseInteger(value, fallback, minimum, maximum, label) {
 function parseOptions(argv = process.argv.slice(2), env = process.env) {
   let host = env.FRAMERINSE_HOST || '0.0.0.0';
   let port = parseInteger(env.FRAMERINSE_PORT, 4173, 1, 65535, 'Port');
-  let dataDir = env.FRAMERINSE_DATA_DIR || path.join(tmpdir(), 'framerinse');
+  let dataDir = env.FRAMERINSE_DATA_DIR || defaultDataDir(env);
   const ttlMinutes = parseInteger(env.FRAMERINSE_JOB_TTL_MINUTES, 60, 5, 1440, 'Job TTL');
+  let maxTotalBytes = parseInteger(env.FRAMERINSE_MAX_TOTAL_MB, 0, 1, 1_000_000, 'Total storage limit') * 1024 * 1024 || DEFAULT_MAX_TOTAL_BYTES;
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -78,6 +80,9 @@ function parseOptions(argv = process.argv.slice(2), env = process.env) {
     } else if (argument === '--data-dir') {
       dataDir = argv[index + 1] || '';
       index += 1;
+    } else if (argument === '--max-total-mb') {
+      maxTotalBytes = parseInteger(argv[index + 1], 0, 1, 1_000_000, 'Total storage limit') * 1024 * 1024;
+      index += 1;
     } else if (argument === '--help' || argument === '-h') {
       return { help: true };
     } else {
@@ -87,7 +92,46 @@ function parseOptions(argv = process.argv.slice(2), env = process.env) {
 
   if (!host) throw new Error('Host cannot be empty.');
   if (!dataDir) throw new Error('Data directory cannot be empty.');
-  return { dataDir: path.resolve(dataDir), help: false, host, port, ttlMinutes };
+  return { dataDir: path.resolve(dataDir), help: false, host, maxTotalBytes, port, ttlMinutes };
+}
+
+// Per-user state directory, not the shared /tmp: nobody else can pre-create it.
+function defaultDataDir(env = process.env) {
+  const stateHome = env.XDG_STATE_HOME || path.join(homedir(), '.local', 'state');
+  return path.join(stateHome, 'framerinse');
+}
+
+// Create the directory with mode 0700, or accept an existing one only when the
+// current user owns it, tightening its mode. Refuses someone else's directory.
+async function ensurePrivateDirectory(directory) {
+  await mkdir(directory, { mode: 0o700, recursive: true });
+  const stats = await stat(directory);
+  if (!stats.isDirectory()) throw new Error(`${directory} is not a directory.`);
+  if (typeof process.getuid === 'function' && stats.uid !== process.getuid()) {
+    throw new Error(`${directory} is owned by another user (uid ${stats.uid}); refusing to use it.`);
+  }
+  if ((stats.mode & 0o777) !== 0o700) await chmod(directory, 0o700);
+}
+
+// Browsers send Sec-Fetch-Site and Origin; a drive-by page on another site is
+// refused before any bytes are stored. Non-browser clients send neither.
+function rejectCrossSite(request) {
+  const site = request.headers['sec-fetch-site'];
+  if (site && site !== 'same-origin' && site !== 'none') {
+    throw new HttpError(403, 'Cross-site requests are not allowed.');
+  }
+  const origin = request.headers.origin;
+  if (origin && origin !== 'null') {
+    let originHost;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      throw new HttpError(403, 'Cross-site requests are not allowed.');
+    }
+    if (originHost !== request.headers.host) throw new HttpError(403, 'Cross-site requests are not allowed.');
+  } else if (origin === 'null') {
+    throw new HttpError(403, 'Cross-site requests are not allowed.');
+  }
 }
 
 function securityHeaders(fileName = '') {
@@ -128,11 +172,20 @@ async function readJson(request) {
   }
 }
 
-async function streamUpload(request, destination) {
+async function streamUpload(request, destination, remainingBytes, reserve) {
+  const contentType = String(request.headers['content-type'] || '').toLowerCase();
+  if (!contentType.startsWith('image/') && !contentType.startsWith('application/octet-stream')) {
+    request.resume();
+    throw new HttpError(415, 'Send the photo bytes with an image/* or application/octet-stream content type.');
+  }
   const declaredSize = Number(request.headers['content-length'] || 0);
   if (declaredSize > MAX_UPLOAD_BYTES) {
     request.resume();
     throw new HttpError(413, 'Photo is over the 100 MB upload limit.');
+  }
+  if (declaredSize > remainingBytes) {
+    request.resume();
+    throw new HttpError(507, 'The server is out of temporary photo storage; clear or wait for old jobs.');
   }
 
   const output = createWriteStream(destination, { flags: 'wx' });
@@ -140,9 +193,14 @@ async function streamUpload(request, destination) {
   try {
     for await (const chunk of request) {
       size += chunk.length;
+      reserve(chunk.length);
       if (size > MAX_UPLOAD_BYTES) {
         request.resume();
         throw new HttpError(413, 'Photo is over the 100 MB upload limit.');
+      }
+      if (size > remainingBytes) {
+        request.resume();
+        throw new HttpError(507, 'The server is out of temporary photo storage; clear or wait for old jobs.');
       }
       if (!output.write(chunk)) await once(output, 'drain');
     }
@@ -285,10 +343,12 @@ async function serveFile(request, response, filePath, contentType, disposition =
 }
 
 async function createFrameRinseServer(options = {}) {
-  const dataDir = path.resolve(options.dataDir || path.join(tmpdir(), 'framerinse'));
+  const dataDir = path.resolve(options.dataDir || defaultDataDir());
   const jobsDir = path.join(dataDir, 'jobs');
   const ttlMinutes = options.ttlMinutes || 60;
-  await mkdir(jobsDir, { recursive: true, mode: 0o700 });
+  const maxTotalBytes = options.maxTotalBytes || DEFAULT_MAX_TOTAL_BYTES;
+  await ensurePrivateDirectory(dataDir);
+  await ensurePrivateDirectory(jobsDir);
 
   const database = new DatabaseSync(path.join(dataDir, 'framerinse.sqlite'), { timeout: 5000 });
   database.exec(`
@@ -359,6 +419,17 @@ async function createFrameRinseServer(options = {}) {
     );
   }
 
+  // Bytes held under jobs/ (sources, previews, decoded copies, outputs).
+  async function storedBytes() {
+    let total = 0;
+    for (const entry of await readdir(jobsDir, { recursive: true, withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const fileStats = await stat(path.join(entry.parentPath, entry.name)).catch(() => null);
+      if (fileStats) total += fileStats.size;
+    }
+    return total;
+  }
+
   async function liveJob(id) {
     const job = getJobStatement.get(id);
     if (!job) return null;
@@ -374,12 +445,25 @@ async function createFrameRinseServer(options = {}) {
   const cleanupTimer = setInterval(() => cleanupExpired().catch(() => {}), 10 * 60 * 1000);
   cleanupTimer.unref();
 
+  let inFlightBytes = 0;
+
   async function uploadPhoto(request, response) {
     const id = randomUUID();
     const directory = jobDirectory(id);
+    const remainingBytes = maxTotalBytes - (await storedBytes()) - inFlightBytes;
+    let reserved = 0;
+    const reserve = (bytes) => {
+      reserved += bytes;
+      inFlightBytes += bytes;
+    };
     await mkdir(directory, { mode: 0o700 });
     try {
-      const sourceBytes = await streamUpload(request, sourcePath(id));
+      let sourceBytes;
+      try {
+        sourceBytes = await streamUpload(request, sourcePath(id), remainingBytes, reserve);
+      } finally {
+        inFlightBytes -= reserved;
+      }
       const prefix = await readPrefix(sourcePath(id));
       const inputInspection = inspectImageMetadata(prefix, '', 'source', { strict: false });
       let metadata;
@@ -501,6 +585,7 @@ async function createFrameRinseServer(options = {}) {
   async function handleRequest(request, response) {
     try {
       const url = new URL(request.url, 'http://localhost');
+      if (request.method !== 'GET' && request.method !== 'HEAD') rejectCrossSite(request);
       if (url.pathname === '/api/jobs' && request.method === 'POST') {
         await uploadPhoto(request, response);
         return;
@@ -576,12 +661,13 @@ async function createFrameRinseServer(options = {}) {
     },
     dataDir,
     handleRequest,
+    maxTotalBytes,
     server,
   };
 }
 
 function printHelp() {
-  process.stdout.write(`FrameRinse self-hosted server\n\nUsage: node server.mjs [--host HOST] [--port PORT] [--data-dir PATH]\n\nEnvironment:\n  FRAMERINSE_HOST              Bind address (default 0.0.0.0)\n  FRAMERINSE_PORT              Port (default 4173)\n  FRAMERINSE_DATA_DIR          Temporary job/database directory\n  FRAMERINSE_JOB_TTL_MINUTES   Auto-delete delay (default 60)\n`);
+  process.stdout.write(`FrameRinse self-hosted server\n\nUsage: node server.mjs [--host HOST] [--port PORT] [--data-dir PATH] [--max-total-mb MB]\n\nEnvironment:\n  FRAMERINSE_HOST              Bind address (default 0.0.0.0)\n  FRAMERINSE_PORT              Port (default 4173)\n  FRAMERINSE_DATA_DIR          Temporary job/database directory (default $XDG_STATE_HOME/framerinse or ~/.local/state/framerinse)\n  FRAMERINSE_JOB_TTL_MINUTES   Auto-delete delay (default 60)\n  FRAMERINSE_MAX_TOTAL_MB      Cap on stored job bytes before uploads get 507 (default 2048)\n`);
 }
 
 async function main() {
@@ -617,4 +703,4 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   });
 }
 
-export { createFrameRinseServer, parseOptions, publicFiles, securityHeaders };
+export { createFrameRinseServer, defaultDataDir, parseOptions, publicFiles, securityHeaders };
