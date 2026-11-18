@@ -1,20 +1,32 @@
 # FrameRinse
 
 FrameRinse is a plain-HTTP, self-hosted photo cleaner. The iPhone uploads the
-original to your server; the server uses Sharp plus a HEIC decoder to rotate,
-resize, cover details, strip common metadata, and verify the exported JPEG,
-PNG, or WebP. SQLite tracks temporary jobs and automatic cleanup.
+original to your server; the server uses the libvips command line to rotate,
+resize, cover details, and re-encode without metadata, then checks the exported
+JPEG, PNG, or WebP itself, byte by byte. SQLite tracks temporary jobs and
+automatic cleanup. It has no npm dependencies: only Node's built-ins and libvips.
 
 The phone only decodes a small server-generated preview and the finished image.
 
 ## Run
 
-Requires Node.js 24.15 or newer.
+Requires Node.js 24.15 or newer and the libvips command-line tools (`vips` and
+`vipsheader`, libvips 8.15 or newer, built with HEIF support for HEIC photos):
 
 ```sh
-npm install
+sudo apt install libvips-tools   # Debian, Ubuntu
+brew install vips                # macOS (Homebrew)
+```
+
+There is nothing to `npm install`:
+
+```sh
 npm start
 ```
+
+FrameRinse finds `vips` and `vipsheader` on `PATH`. To use another copy, set
+`FRAMERINSE_VIPS_DIR` to the folder that holds both. The server refuses to start
+when they are missing.
 
 FrameRinse listens on `0.0.0.0:4173`. From an iPhone on the same network, open:
 
@@ -50,10 +62,29 @@ FRAMERINSE_PORT=4173
 FRAMERINSE_DATA_DIR=/path/to/private/runtime/storage
 FRAMERINSE_JOB_TTL_MINUTES=60
 FRAMERINSE_MAX_TOTAL_MB=2048
+FRAMERINSE_VIPS_DIR=/path/to/folder/with/vips   # optional; PATH otherwise
 ```
 
-The server accepts photos up to 100 MB and 100 megapixels. It processes the
-first frame of animated inputs.
+The server accepts photos up to 100 MB and 100 megapixels. The size is read
+from the file's header before any pixel is decoded. It processes the first frame
+of animated inputs.
+
+## How the metadata goes
+
+- The decoder is chosen from the file's first bytes (JPEG, PNG, WebP, GIF, TIFF,
+  HEIC, AVIF), never from its name or content type, and must match what libvips
+  itself reads; libvips' loaders that are unsafe for untrusted input are blocked.
+- After rotation and conversion to 8-bit sRGB, the pixels are written out as bare
+  bytes and read back as a new image, so no metadata field reaches the encoder.
+  The encoder is also told to keep none.
+- Every export and preview is then walked by `src/verify.js`, which accepts only
+  the structures needed to show the image (JPEG frame, tables, scans and a plain
+  JFIF header; PNG header, palette, data, transparency, colour and resolution
+  chunks; WebP image and alpha chunks) and refuses everything else: EXIF, XMP,
+  IPTC, ICC profiles, comments, text, timestamps, thumbnails, unknown chunks and
+  bytes after the end. An export that fails is not served.
+- All intermediate files live in the job's own private folder and are removed
+  when the step ends.
 
 ## Checks
 
@@ -62,9 +93,10 @@ npm test
 npm run check
 ```
 
-The tests cover SQLite job lifecycle, EXIF orientation, HEIC input, server
-previews, solid covers, JPEG/PNG/WebP exports, metadata verification, cleanup,
-and private-file containment.
+The tests need `vips` as above. They cover SQLite job lifecycle, EXIF
+orientation, HEIC input, server previews, solid covers, JPEG/PNG/WebP exports,
+PNG text removal, the pixel limit, the strict output check on hand-made files,
+cleanup, and private-file containment.
 
 Metadata removal does not make the visible photo anonymous. Faces, reflections,
 documents, landmarks, tattoos, and other visible details can still identify a

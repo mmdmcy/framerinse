@@ -8,10 +8,9 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
-import decodeHeic from 'heic-decode';
-import sharp from 'sharp';
-
 import { detectContainer, inspectImageMetadata } from './src/metadata.js';
+import { verifyCleanImage } from './src/verify.js';
+import { checkVips, LOADERS, readSourceHeader, renderImage, SOURCE_FORMATS, VipsError } from './src/vips.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
@@ -24,7 +23,6 @@ const OUTPUT_FORMATS = {
   png: { extension: 'png', mime: 'image/png' },
   webp: { extension: 'webp', mime: 'image/webp' },
 };
-const INPUT_FORMATS = new Set(['avif', 'gif', 'heic', 'heif', 'jpeg', 'png', 'tiff', 'webp']);
 
 const publicFiles = new Map([
   ['index.html', 'text/html; charset=utf-8'],
@@ -214,16 +212,6 @@ async function streamUpload(request, destination, remainingBytes, reserve) {
   return size;
 }
 
-function metadataWasPresent(metadata) {
-  return Boolean(
-    metadata.exif ||
-      metadata.xmp ||
-      metadata.iptc ||
-      metadata.orientation ||
-      (Array.isArray(metadata.comments) && metadata.comments.length),
-  );
-}
-
 async function readPrefix(filePath, maximumBytes = 4 * 1024 * 1024) {
   const handle = await open(filePath, 'r');
   try {
@@ -232,35 +220,6 @@ async function readPrefix(filePath, maximumBytes = 4 * 1024 * 1024) {
     return buffer.subarray(0, bytesRead);
   } finally {
     await handle.close();
-  }
-}
-
-async function decodeHeicSource(sourceFile, decodedFile) {
-  const source = await readFile(sourceFile);
-  let images;
-  try {
-    images = await decodeHeic.all({ buffer: source });
-    const image = images[0];
-    const width = Number(image?.width);
-    const height = Number(image?.height);
-    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
-      throw new HttpError(415, 'The server could not read that HEIC photo.');
-    }
-    if (width * height > MAX_INPUT_PIXELS) {
-      throw new HttpError(413, 'Photo is over the 100 megapixel processing limit.');
-    }
-
-    const decoded = await image.decode();
-    const pixels = Buffer.from(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
-    await sharp(pixels, { raw: { channels: 4, height, width } })
-      .png({ compressionLevel: 1 })
-      .toFile(decodedFile);
-    return { format: 'heic', height, width };
-  } catch (error) {
-    if (error instanceof HttpError) throw error;
-    throw new HttpError(415, 'The server could not decode that HEIC photo.');
-  } finally {
-    images?.dispose?.();
   }
 }
 
@@ -308,19 +267,6 @@ function outputDimensions(sourceWidth, sourceHeight, maxEdge) {
   };
 }
 
-function coverSvg(covers, width, height) {
-  const rectangles = covers
-    .map((cover) => {
-      const x = Math.max(0, Math.floor(cover.x * width) - 1);
-      const y = Math.max(0, Math.floor(cover.y * height) - 1);
-      const right = Math.min(width, Math.ceil((cover.x + cover.width) * width) + 1);
-      const bottom = Math.min(height, Math.ceil((cover.y + cover.height) * height) + 1);
-      return `<rect x="${x}" y="${y}" width="${right - x}" height="${bottom - y}" fill="#050706"/>`;
-    })
-    .join('');
-  return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">${rectangles}</svg>`);
-}
-
 async function serveFile(request, response, filePath, contentType, disposition = '', securityName = '') {
   let fileStats;
   try {
@@ -347,6 +293,7 @@ async function createFrameRinseServer(options = {}) {
   const jobsDir = path.join(dataDir, 'jobs');
   const ttlMinutes = options.ttlMinutes || 60;
   const maxTotalBytes = options.maxTotalBytes || DEFAULT_MAX_TOTAL_BYTES;
+  await checkVips();
   await ensurePrivateDirectory(dataDir);
   await ensurePrivateDirectory(jobsDir);
 
@@ -386,18 +333,8 @@ async function createFrameRinseServer(options = {}) {
 
   const jobDirectory = (id) => path.join(jobsDir, id);
   const sourcePath = (id) => path.join(jobDirectory(id), 'source');
-  const decodedPath = (id) => path.join(jobDirectory(id), 'decoded.png');
   const previewPath = (id) => path.join(jobDirectory(id), 'preview.jpg');
   const outputPath = (id, format) => path.join(jobDirectory(id), `output.${OUTPUT_FORMATS[format].extension}`);
-
-  async function processingPath(id) {
-    try {
-      await stat(decodedPath(id));
-      return decodedPath(id);
-    } catch {
-      return sourcePath(id);
-    }
-  }
 
   async function removeJob(id) {
     deleteJobStatement.run(id);
@@ -419,7 +356,7 @@ async function createFrameRinseServer(options = {}) {
     );
   }
 
-  // Bytes held under jobs/ (sources, previews, decoded copies, outputs).
+  // Bytes held under jobs/ (sources, previews, outputs, work files in progress).
   async function storedBytes() {
     let total = 0;
     for (const entry of await readdir(jobsDir, { recursive: true, withFileTypes: true })) {
@@ -466,35 +403,57 @@ async function createFrameRinseServer(options = {}) {
       }
       const prefix = await readPrefix(sourcePath(id));
       const inputInspection = inspectImageMetadata(prefix, '', 'source', { strict: false });
-      let metadata;
-      let metadataFullyInspected = true;
-      let processFile = sourcePath(id);
-      if (detectContainer(prefix) === 'heic') {
-        metadata = await decodeHeicSource(sourcePath(id), decodedPath(id));
-        metadataFullyInspected = false;
-        processFile = decodedPath(id);
-      } else {
-        try {
-          metadata = await sharp(sourcePath(id), { animated: false, limitInputPixels: MAX_INPUT_PIXELS }).metadata();
-        } catch {
-          throw new HttpError(415, 'The server could not decode that photo format.');
+      const container = detectContainer(prefix);
+      const format = SOURCE_FORMATS[container];
+      if (!format) {
+        if (/^\s*(<\?xml|<svg|%PDF)/i.test(prefix.subarray(0, 256).toString('latin1'))) {
+          throw new HttpError(415, 'Choose a raster photo such as JPEG, PNG, WebP, HEIC, AVIF, GIF, or TIFF.');
         }
+        throw new HttpError(415, 'The server could not decode that photo format.');
       }
-      if (!INPUT_FORMATS.has(metadata.format)) {
-        throw new HttpError(415, 'Choose a raster photo such as JPEG, PNG, WebP, HEIC, AVIF, GIF, or TIFF.');
+      const isHeic = container === 'heic';
+      const unreadable = isHeic ? 'The server could not decode that HEIC photo.' : 'The server could not decode that photo format.';
+      const header = await readSourceHeader(sourcePath(id), directory);
+      if (header.loader !== LOADERS[format] || !Number.isInteger(header.width) || !Number.isInteger(header.height) || header.width < 1 || header.height < 1) {
+        throw new HttpError(415, unreadable);
       }
-      const oriented = metadata.autoOrient || { width: metadata.width, height: metadata.height };
-      if (!oriented.width || !oriented.height || oriented.width * oriented.height > MAX_INPUT_PIXELS) {
-        throw new HttpError(413, 'Photo is over the 100 megapixel processing limit.');
+      // HEIC rotation is applied by the decoder itself; EXIF orientation counts for the rest.
+      const autorotate = !LOADERS[format].startsWith('heif');
+      const swapped = autorotate && header.orientation >= 5 && header.orientation <= 8;
+      const oriented = swapped ? { width: header.height, height: header.width } : { width: header.width, height: header.height };
+      // Refused from the header alone, before any pixel is decoded. The answers
+      // are the ones the server gave before: 413 for HEIC, and for the rest the
+      // "could not decode" 415 that the old image library's pixel limit raised.
+      if (oriented.width * oriented.height > MAX_INPUT_PIXELS) {
+        if (isHeic) throw new HttpError(413, 'Photo is over the 100 megapixel processing limit.');
+        throw new HttpError(415, unreadable);
       }
-      const metadataDetected = metadataWasPresent(metadata) || inputInspection.hasSensitiveMetadata;
+      const metadataFullyInspected = !isHeic;
+      const metadataDetected = header.metadataPresent || inputInspection.hasSensitiveMetadata;
 
-      await sharp(processFile, { animated: false, limitInputPixels: MAX_INPUT_PIXELS })
-        .autoOrient()
-        .resize({ width: PREVIEW_EDGE, height: PREVIEW_EDGE, fit: 'inside', withoutEnlargement: true })
-        .flatten({ background: '#ffffff' })
-        .jpeg({ quality: 82 })
-        .toFile(previewPath(id));
+      const preview = outputDimensions(oriented.width, oriented.height, PREVIEW_EDGE);
+      try {
+        await renderImage({
+          autorotate,
+          flatten: true,
+          height: preview.height,
+          loader: LOADERS[format],
+          output: previewPath(id),
+          save: { format: 'jpeg', quality: 82 },
+          source: sourcePath(id),
+          sourceHeight: oriented.height,
+          sourceWidth: oriented.width,
+          width: preview.width,
+        });
+      } catch (error) {
+        if (error instanceof VipsError) throw new HttpError(415, unreadable);
+        throw error;
+      }
+      // The preview only goes back to the uploader, but it gets the same strict check.
+      const previewCheck = verifyCleanImage(await readFile(previewPath(id)));
+      if (!previewCheck.ok || previewCheck.width !== preview.width || previewCheck.height !== preview.height) {
+        throw new Error(`Generated preview did not pass the metadata check (${previewCheck.problems.join(', ') || 'size mismatch'}).`);
+      }
 
       const now = Date.now();
       const expiresAt = now + ttlMinutes * 60 * 1000;
@@ -502,7 +461,7 @@ async function createFrameRinseServer(options = {}) {
         id,
         now,
         expiresAt,
-        metadata.format,
+        format,
         oriented.width,
         oriented.height,
         sourceBytes,
@@ -514,7 +473,7 @@ async function createFrameRinseServer(options = {}) {
         previewUrl: `/api/jobs/${id}/preview`,
         source: {
           bytes: sourceBytes,
-          format: metadata.format,
+          format,
           height: oriented.height,
           metadataDetected,
           metadataStatus: metadataDetected ? 'detected' : metadataFullyInspected ? 'not-detected' : 'not-fully-checked',
@@ -535,28 +494,37 @@ async function createFrameRinseServer(options = {}) {
     const output = OUTPUT_FORMATS[settings.format];
     const temporaryPath = path.join(jobDirectory(id), `output-${randomUUID()}.tmp`);
     const finalPath = outputPath(id, settings.format);
-    const processFile = await processingPath(id);
 
     try {
-      let pipeline = sharp(processFile, { animated: false, limitInputPixels: MAX_INPUT_PIXELS })
-        .autoOrient()
-        .resize({ width: settings.maxEdge, height: settings.maxEdge, fit: 'inside', withoutEnlargement: true });
-      if (settings.covers.length) {
-        pipeline = pipeline.composite([{ input: coverSvg(settings.covers, dimensions.width, dimensions.height) }]);
-      }
-      if (settings.format === 'jpeg') {
-        pipeline = pipeline.flatten({ background: '#ffffff' }).jpeg({ quality: settings.quality, mozjpeg: true });
-      } else if (settings.format === 'png') {
-        pipeline = pipeline.png({ compressionLevel: 9 });
-      } else {
-        pipeline = pipeline.webp({ quality: settings.quality });
-      }
-      await pipeline.toFile(temporaryPath);
+      await renderImage({
+        autorotate: !LOADERS[job.source_format].startsWith('heif'),
+        covers: settings.covers,
+        flatten: settings.format === 'jpeg',
+        height: dimensions.height,
+        loader: LOADERS[job.source_format],
+        output: temporaryPath,
+        save: { format: settings.format, progressive: true, quality: settings.quality },
+        source: sourcePath(id),
+        sourceHeight: job.source_height,
+        sourceWidth: job.source_width,
+        width: dimensions.width,
+      });
 
       const outputBytes = await readFile(temporaryPath);
+      // Two independent checks: the original marker scan, and a strict
+      // allow-list walk of the whole container that refuses anything that is
+      // not needed to draw the pixels.
       const inspection = inspectImageMetadata(outputBytes, output.mime, `framerinse.${output.extension}`);
-      if (!inspection.fullyChecked || inspection.hasSensitiveMetadata) {
-        throw new Error('Generated output did not pass the metadata check.');
+      const verified = verifyCleanImage(outputBytes);
+      if (
+        !inspection.fullyChecked ||
+        inspection.hasSensitiveMetadata ||
+        !verified.ok ||
+        verified.container !== settings.format ||
+        verified.width !== dimensions.width ||
+        verified.height !== dimensions.height
+      ) {
+        throw new Error(`Generated output did not pass the metadata check (${verified.problems.join(', ') || 'size or container mismatch'}).`);
       }
 
       for (const entry of await readdir(jobDirectory(id))) {

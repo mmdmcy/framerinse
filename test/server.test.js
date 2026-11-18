@@ -1,15 +1,84 @@
 import assert from 'node:assert/strict';
-import { stat } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { chmod, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import test from 'node:test';
-
-import sharp from 'sharp';
+import { crc32 } from 'node:zlib';
 
 import { createFrameRinseServer, defaultDataDir, parseOptions, publicFiles, securityHeaders } from '../server.mjs';
 import { inspectImageMetadata } from '../src/metadata.js';
+import { verifyCleanImage } from '../src/verify.js';
+
+// Fixtures are made and decoded with the same libvips command line the server uses.
+function vips(tool, args) {
+  const command = process.env.FRAMERINSE_VIPS_DIR ? path.join(process.env.FRAMERINSE_VIPS_DIR, tool) : tool;
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { timeout: 60_000 }, (error, stdout, stderr) => (error ? reject(new Error(stderr || error.message)) : resolve(stdout)));
+  });
+}
+
+async function withScratch(run) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'framerinse-fixture-'));
+  try {
+    return await run(directory);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+}
+
+// A solid-colour image saved with no metadata, as bytes.
+function solidImage({ width, height, colour, saver, options = [] }) {
+  return withScratch(async (directory) => {
+    const black = path.join(directory, 'black.v');
+    const coloured = path.join(directory, 'coloured.v');
+    const typed = path.join(directory, 'typed.v');
+    const output = path.join(directory, 'output');
+    await vips('vips', ['black', black, String(width), String(height), '--bands', String(colour.length)]);
+    await vips('vips', ['linear', black, coloured, colour.map(() => '1').join(' '), colour.join(' ')]);
+    await vips('vips', ['cast', coloured, typed, 'uchar']);
+    await vips('vips', [saver, typed, output, '--keep', 'none', ...options]);
+    return readFile(output);
+  });
+}
+
+// Decoded pixels of an image: { width, height, channels, data }.
+function decodePixels(bytes) {
+  return withScratch(async (directory) => {
+    const input = path.join(directory, 'input');
+    const raw = path.join(directory, 'pixels.raw');
+    await writeFile(input, bytes);
+    const [width, height, channels] = await Promise.all(
+      ['width', 'height', 'bands'].map(async (field) => Number(await vips('vipsheader', ['-f', field, input]))),
+    );
+    await vips('vips', ['rawsave', input, raw]);
+    return { channels, data: await readFile(raw), height, width };
+  });
+}
+
+function pngChunk(type, data) {
+  const typed = Buffer.concat([Buffer.from(type, 'latin1'), data]);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const checksum = Buffer.alloc(4);
+  checksum.writeUInt32BE(crc32(typed));
+  return Buffer.concat([length, typed, checksum]);
+}
+
+// Adds private text, XMP, time, and EXIF chunks after a PNG's header.
+function withPngMetadata(png) {
+  const headerEnd = 8 + 25;
+  return Buffer.concat([
+    png.subarray(0, headerEnd),
+    pngChunk('tEXt', Buffer.from('Author\0Private Person', 'latin1')),
+    pngChunk('iTXt', Buffer.from('XML:com.adobe.xmp\0\0\0\0\0<x:xmpmeta>GPS 52.37N</x:xmpmeta>', 'latin1')),
+    pngChunk('tIME', Buffer.from([0x07, 0xea, 11, 18, 12, 34, 56])),
+    pngChunk('eXIf', orientationExif(1).subarray(6)),
+    png.subarray(headerEnd),
+  ]);
+}
 
 async function withServer(run, options = {}) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'framerinse-test-'));
@@ -62,11 +131,7 @@ function orientationExif(orientation) {
 }
 
 async function sourceJpeg() {
-  const clean = await sharp({
-    create: { background: '#d9ff67', channels: 3, height: 80, width: 120 },
-  })
-    .jpeg({ quality: 95 })
-    .toBuffer();
+  const clean = await solidImage({ colour: [0xd9, 0xff, 0x67], height: 80, saver: 'jpegsave', width: 120, options: ['--Q', '95'] });
   return Buffer.concat([
     clean.subarray(0, 2),
     jpegSegment(0xe1, orientationExif(6)),
@@ -141,9 +206,11 @@ test('uploads, auto-orients, previews, scrubs all formats, and clears a SQLite j
     const preview = await fetch(`${baseUrl}${created.body.previewUrl}`);
     assert.equal(preview.status, 200);
     assert.equal(preview.headers.get('content-type'), 'image/jpeg');
-    const previewMetadata = await sharp(Buffer.from(await preview.arrayBuffer())).metadata();
-    assert.equal(previewMetadata.width, 80);
-    assert.equal(previewMetadata.height, 120);
+    const previewBytes = Buffer.from(await preview.arrayBuffer());
+    const previewCheck = verifyCleanImage(previewBytes);
+    assert.equal(previewCheck.ok, true, previewCheck.problems.join(', '));
+    assert.equal(previewCheck.width, 80);
+    assert.equal(previewCheck.height, 120);
 
     for (const format of ['jpeg', 'png', 'webp']) {
       const scrubResponse = await fetch(`${baseUrl}/api/jobs/${created.body.id}/scrub`, {
@@ -168,9 +235,13 @@ test('uploads, auto-orients, previews, scrubs all formats, and clears a SQLite j
       const inspection = inspectImageMetadata(bytes, fileResponse.headers.get('content-type'));
       assert.equal(inspection.fullyChecked, true);
       assert.equal(inspection.hasSensitiveMetadata, false);
-      const decoded = await sharp(bytes).raw().toBuffer({ resolveWithObject: true });
-      const sampleOffset = (Math.round(output.height * 0.15) * output.width + Math.round(output.width * 0.15)) * decoded.info.channels;
-      assert.ok(decoded.data[sampleOffset] < 25, 'solid cover should be dark in the output pixels');
+      const verified = verifyCleanImage(bytes);
+      assert.equal(verified.ok, true, verified.problems.join(', '));
+      assert.deepEqual([verified.container, verified.width, verified.height], [format, 80, 120]);
+      const decoded = await decodePixels(bytes);
+      const pixel = (x, y) => decoded.data[(y * decoded.width + x) * decoded.channels];
+      assert.ok(pixel(Math.round(output.width * 0.15), Math.round(output.height * 0.15)) < 25, 'solid cover should be dark in the output pixels');
+      assert.ok(pixel(Math.round(output.width * 0.8), Math.round(output.height * 0.8)) > 150, 'uncovered pixels keep their colour');
 
       const download = await fetch(`${baseUrl}${output.downloadUrl}`);
       assert.match(download.headers.get('content-disposition'), /^attachment; filename="framerinse\./);
@@ -200,7 +271,9 @@ test('decodes HEIC on the server and exports a clean JPEG', async () => {
       },
       { format: 'heic', height: 8, metadataStatus: 'not-fully-checked', width: 12 },
     );
-    await stat(path.join(dataDir, 'jobs', created.id, 'decoded.png'));
+    // Decoded straight from the original by libvips; no decoded copy is kept.
+    await stat(path.join(dataDir, 'jobs', created.id, 'preview.jpg'));
+    await assert.rejects(stat(path.join(dataDir, 'jobs', created.id, 'decoded.png')));
 
     const scrubResponse = await fetch(`${baseUrl}/api/jobs/${created.id}/scrub`, {
       body: JSON.stringify({ covers: [], format: 'jpeg', maxEdge: 1080, quality: 90 }),
@@ -227,6 +300,66 @@ test('rejects invalid image uploads and unsafe scrub settings', async () => {
       method: 'POST',
     });
     assert.equal(invalidCover.status, 400);
+  });
+});
+
+test('removes PNG text, XMP, time, and EXIF chunks from every export format', async () => {
+  const png = withPngMetadata(await solidImage({ colour: [40, 90, 200, 255], height: 60, saver: 'pngsave', width: 90 }));
+  assert.equal(inspectImageMetadata(png, 'image/png').hasSensitiveMetadata, true);
+  assert.equal(verifyCleanImage(png).ok, false);
+  await withServer(async (baseUrl) => {
+    const upload = await fetch(`${baseUrl}/api/jobs`, { body: png, headers: { 'Content-Type': 'image/png' }, method: 'POST' });
+    assert.equal(upload.status, 201);
+    const created = await upload.json();
+    assert.equal(created.source.metadataDetected, true);
+    assert.equal(created.source.metadataStatus, 'detected');
+    for (const format of ['png', 'jpeg', 'webp']) {
+      const scrub = await fetch(`${baseUrl}/api/jobs/${created.id}/scrub`, {
+        body: JSON.stringify({ covers: [], format, maxEdge: 1080, quality: 90 }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+      assert.equal(scrub.status, 200, format);
+      const bytes = Buffer.from(await (await fetch(`${baseUrl}/api/jobs/${created.id}/output`)).arrayBuffer());
+      const verified = verifyCleanImage(bytes);
+      assert.equal(verified.ok, true, `${format}: ${verified.problems.join(', ')}`);
+      assert.equal(bytes.includes(Buffer.from('Private Person')), false);
+      assert.equal(bytes.includes(Buffer.from('xmpmeta')), false);
+    }
+  });
+});
+
+test('refuses an image over the pixel limit from its header, before decoding it', async () => {
+  // 12000 x 9000 = 108 megapixels; the pixel data is not even valid.
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(12000, 0);
+  header.writeUInt32BE(9000, 4);
+  header[8] = 8;
+  header[9] = 2;
+  const oversized = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', Buffer.from([0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01])),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+  await withServer(async (baseUrl, _port, dataDir) => {
+    const response = await fetch(`${baseUrl}/api/jobs`, { body: oversized, headers: { 'Content-Type': 'image/png' }, method: 'POST' });
+    // The same answer as before the move to libvips: 415 with the decode message.
+    assert.equal(response.status, 415);
+    assert.deepEqual(await response.json(), { error: 'The server could not decode that photo format.' });
+    assert.deepEqual(await readdir(path.join(dataDir, 'jobs')), []);
+  });
+});
+
+test('names a raster format when given a vector or document file', async () => {
+  await withServer(async (baseUrl) => {
+    const svg = await fetch(`${baseUrl}/api/jobs`, {
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>',
+      headers: { 'Content-Type': 'image/svg+xml' },
+      method: 'POST',
+    });
+    assert.equal(svg.status, 415);
+    assert.match((await svg.json()).error, /Choose a raster photo/);
   });
 });
 
