@@ -4,11 +4,14 @@
   "private": true,
   "description": "A self-hosted photo server that re-encodes images without common identifying metadata, using Node built-ins and the libvips command line.",
   "type": "module",
+  "bin": {
+    "framerinse": "cli.mjs"
+  },
   "scripts": {
     "start": "node server.mjs",
     "start:local": "node server.mjs --host 127.0.0.1",
     "test": "node --test",
-    "check": "node --check server.mjs && node --check src/app.js && node --check src/metadata.js && node --check src/verify.js && node --check src/vips.js && node --test"
+    "check": "node --check server.mjs && node --check cli.mjs && node --check src/pipeline.js && node --check src/app.js && node --check src/metadata.js && node --check src/verify.js && node --check src/vips.js && node --test"
   },
   "engines": {
     "node": ">=24.15"

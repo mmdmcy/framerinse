@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { homedir } from 'node:os';
@@ -8,21 +8,15 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
-import { detectContainer, inspectImageMetadata } from './src/metadata.js';
+import { cleanImage, InputError, OUTPUT_FORMATS, outputDimensions, readSource, unreadableMessage, validateScrubSettings } from './src/pipeline.js';
 import { verifyCleanImage } from './src/verify.js';
-import { checkVips, LOADERS, readSourceHeader, renderImage, SOURCE_FORMATS, VipsError } from './src/vips.js';
+import { checkVips, renderImage, VipsError } from './src/vips.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
-const MAX_INPUT_PIXELS = 100_000_000;
 const MAX_JSON_BYTES = 64 * 1024;
 const PREVIEW_EDGE = 1400;
-const OUTPUT_FORMATS = {
-  jpeg: { extension: 'jpg', mime: 'image/jpeg' },
-  png: { extension: 'png', mime: 'image/png' },
-  webp: { extension: 'webp', mime: 'image/webp' },
-};
 
 const publicFiles = new Map([
   ['index.html', 'text/html; charset=utf-8'],
@@ -44,12 +38,8 @@ const documentCsp = [
   "style-src 'self'",
 ].join('; ');
 
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
+// The pipeline's refusals (InputError) carry their HTTP status too.
+class HttpError extends InputError {}
 
 function parseInteger(value, fallback, minimum, maximum, label) {
   if (value === undefined || value === '') return fallback;
@@ -212,61 +202,6 @@ async function streamUpload(request, destination, remainingBytes, reserve) {
   return size;
 }
 
-async function readPrefix(filePath, maximumBytes = 4 * 1024 * 1024) {
-  const handle = await open(filePath, 'r');
-  try {
-    const buffer = Buffer.alloc(maximumBytes);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    return buffer.subarray(0, bytesRead);
-  } finally {
-    await handle.close();
-  }
-}
-
-function validateScrubSettings(value) {
-  const format = typeof value?.format === 'string' ? value.format : 'jpeg';
-  if (!OUTPUT_FORMATS[format]) throw new HttpError(400, 'Output format must be JPEG, PNG, or WebP.');
-  const maxEdge = Number(value?.maxEdge ?? 2048);
-  if (![1080, 2048, 4096].includes(maxEdge)) throw new HttpError(400, 'Output size is not supported.');
-  const quality = Number(value?.quality ?? 90);
-  if (!Number.isInteger(quality) || quality < 65 || quality > 100) {
-    throw new HttpError(400, 'Quality must be from 65 to 100.');
-  }
-  if (!Array.isArray(value?.covers) || value.covers.length > 50) {
-    throw new HttpError(400, 'Covers must be an array containing at most 50 rectangles.');
-  }
-
-  const covers = value.covers.map((cover) => {
-    const normalized = {
-      x: Number(cover?.x),
-      y: Number(cover?.y),
-      width: Number(cover?.width),
-      height: Number(cover?.height),
-    };
-    if (
-      Object.values(normalized).some((item) => !Number.isFinite(item)) ||
-      normalized.x < 0 ||
-      normalized.y < 0 ||
-      normalized.width <= 0 ||
-      normalized.height <= 0 ||
-      normalized.x + normalized.width > 1.001 ||
-      normalized.y + normalized.height > 1.001
-    ) {
-      throw new HttpError(400, 'A cover rectangle is outside the photo.');
-    }
-    return normalized;
-  });
-  return { covers, format, maxEdge, quality };
-}
-
-function outputDimensions(sourceWidth, sourceHeight, maxEdge) {
-  const scale = Math.min(1, maxEdge / Math.max(sourceWidth, sourceHeight));
-  return {
-    width: Math.max(1, Math.round(sourceWidth * scale)),
-    height: Math.max(1, Math.round(sourceHeight * scale)),
-  };
-}
-
 async function serveFile(request, response, filePath, contentType, disposition = '', securityName = '') {
   let fileStats;
   try {
@@ -401,52 +336,23 @@ async function createFrameRinseServer(options = {}) {
       } finally {
         inFlightBytes -= reserved;
       }
-      const prefix = await readPrefix(sourcePath(id));
-      const inputInspection = inspectImageMetadata(prefix, '', 'source', { strict: false });
-      const container = detectContainer(prefix);
-      const format = SOURCE_FORMATS[container];
-      if (!format) {
-        if (/^\s*(<\?xml|<svg|%PDF)/i.test(prefix.subarray(0, 256).toString('latin1'))) {
-          throw new HttpError(415, 'Choose a raster photo such as JPEG, PNG, WebP, HEIC, AVIF, GIF, or TIFF.');
-        }
-        throw new HttpError(415, 'The server could not decode that photo format.');
-      }
-      const isHeic = container === 'heic';
-      const unreadable = isHeic ? 'The server could not decode that HEIC photo.' : 'The server could not decode that photo format.';
-      const header = await readSourceHeader(sourcePath(id), directory);
-      if (header.loader !== LOADERS[format] || !Number.isInteger(header.width) || !Number.isInteger(header.height) || header.width < 1 || header.height < 1) {
-        throw new HttpError(415, unreadable);
-      }
-      // HEIC rotation is applied by the decoder itself; EXIF orientation counts for the rest.
-      const autorotate = !LOADERS[format].startsWith('heif');
-      const swapped = autorotate && header.orientation >= 5 && header.orientation <= 8;
-      const oriented = swapped ? { width: header.height, height: header.width } : { width: header.width, height: header.height };
-      // Refused from the header alone, before any pixel is decoded. The answers
-      // are the ones the server gave before: 413 for HEIC, and for the rest the
-      // "could not decode" 415 that the old image library's pixel limit raised.
-      if (oriented.width * oriented.height > MAX_INPUT_PIXELS) {
-        if (isHeic) throw new HttpError(413, 'Photo is over the 100 megapixel processing limit.');
-        throw new HttpError(415, unreadable);
-      }
-      const metadataFullyInspected = !isHeic;
-      const metadataDetected = header.metadataPresent || inputInspection.hasSensitiveMetadata;
-
-      const preview = outputDimensions(oriented.width, oriented.height, PREVIEW_EDGE);
+      const source = await readSource(sourcePath(id), directory);
+      const preview = outputDimensions(source.width, source.height, PREVIEW_EDGE);
       try {
         await renderImage({
-          autorotate,
+          autorotate: source.autorotate,
           flatten: true,
           height: preview.height,
-          loader: LOADERS[format],
+          loader: source.loader,
           output: previewPath(id),
           save: { format: 'jpeg', quality: 82 },
           source: sourcePath(id),
-          sourceHeight: oriented.height,
-          sourceWidth: oriented.width,
+          sourceHeight: source.height,
+          sourceWidth: source.width,
           width: preview.width,
         });
       } catch (error) {
-        if (error instanceof VipsError) throw new HttpError(415, unreadable);
+        if (error instanceof VipsError) throw new HttpError(415, unreadableMessage(source.format));
         throw error;
       }
       // The preview only goes back to the uploader, but it gets the same strict check.
@@ -461,11 +367,11 @@ async function createFrameRinseServer(options = {}) {
         id,
         now,
         expiresAt,
-        format,
-        oriented.width,
-        oriented.height,
+        source.format,
+        source.width,
+        source.height,
         sourceBytes,
-        metadataDetected ? 1 : 0,
+        source.metadataDetected ? 1 : 0,
       );
       sendJson(response, 201, {
         id,
@@ -473,11 +379,11 @@ async function createFrameRinseServer(options = {}) {
         previewUrl: `/api/jobs/${id}/preview`,
         source: {
           bytes: sourceBytes,
-          format,
-          height: oriented.height,
-          metadataDetected,
-          metadataStatus: metadataDetected ? 'detected' : metadataFullyInspected ? 'not-detected' : 'not-fully-checked',
-          width: oriented.width,
+          format: source.format,
+          height: source.height,
+          metadataDetected: source.metadataDetected,
+          metadataStatus: source.metadataStatus,
+          width: source.width,
         },
       });
     } catch (error) {
@@ -490,42 +396,18 @@ async function createFrameRinseServer(options = {}) {
     const job = await liveJob(id);
     if (!job) throw new HttpError(404, 'Photo job expired or was cleared.');
     const settings = validateScrubSettings(await readJson(request));
-    const dimensions = outputDimensions(job.source_width, job.source_height, settings.maxEdge);
-    const output = OUTPUT_FORMATS[settings.format];
     const temporaryPath = path.join(jobDirectory(id), `output-${randomUUID()}.tmp`);
     const finalPath = outputPath(id, settings.format);
 
     try {
-      await renderImage({
-        autorotate: !LOADERS[job.source_format].startsWith('heif'),
-        covers: settings.covers,
-        flatten: settings.format === 'jpeg',
-        height: dimensions.height,
-        loader: LOADERS[job.source_format],
+      const output = await cleanImage({
         output: temporaryPath,
-        save: { format: settings.format, progressive: true, quality: settings.quality },
+        settings,
         source: sourcePath(id),
+        sourceFormat: job.source_format,
         sourceHeight: job.source_height,
         sourceWidth: job.source_width,
-        width: dimensions.width,
       });
-
-      const outputBytes = await readFile(temporaryPath);
-      // Two independent checks: the original marker scan, and a strict
-      // allow-list walk of the whole container that refuses anything that is
-      // not needed to draw the pixels.
-      const inspection = inspectImageMetadata(outputBytes, output.mime, `framerinse.${output.extension}`);
-      const verified = verifyCleanImage(outputBytes);
-      if (
-        !inspection.fullyChecked ||
-        inspection.hasSensitiveMetadata ||
-        !verified.ok ||
-        verified.container !== settings.format ||
-        verified.width !== dimensions.width ||
-        verified.height !== dimensions.height
-      ) {
-        throw new Error(`Generated output did not pass the metadata check (${verified.problems.join(', ') || 'size or container mismatch'}).`);
-      }
 
       for (const entry of await readdir(jobDirectory(id))) {
         if (entry.startsWith('output.') && path.join(jobDirectory(id), entry) !== finalPath) {
@@ -533,16 +415,16 @@ async function createFrameRinseServer(options = {}) {
         }
       }
       await rename(temporaryPath, finalPath);
-      updateOutputStatement.run(settings.format, dimensions.width, dimensions.height, outputBytes.length, id);
+      updateOutputStatement.run(settings.format, output.width, output.height, output.bytes, id);
       sendJson(response, 200, {
         coverCount: settings.covers.length,
         downloadUrl: `/api/jobs/${id}/output?download=1`,
         expiresAt: job.expires_at,
         format: settings.format,
-        height: dimensions.height,
+        height: output.height,
         outputUrl: `/api/jobs/${id}/output`,
-        size: outputBytes.length,
-        width: dimensions.width,
+        size: output.bytes,
+        width: output.width,
       });
     } catch (error) {
       await unlink(temporaryPath).catch(() => {});
@@ -611,9 +493,9 @@ async function createFrameRinseServer(options = {}) {
         response.destroy();
         return;
       }
-      const status = error instanceof HttpError ? error.status : 500;
-      const message = error instanceof HttpError ? error.message : 'The server could not process the photo.';
-      if (!(error instanceof HttpError)) {
+      const status = error instanceof InputError ? error.status : 500;
+      const message = error instanceof InputError ? error.message : 'The server could not process the photo.';
+      if (!(error instanceof InputError)) {
         process.stderr.write(`FrameRinse request failed: ${error?.stack || error}\n`);
       }
       sendJson(response, status, { error: message });

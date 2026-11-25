@@ -39,6 +39,21 @@ const METADATA_FIELDS = ['exif-data', 'xmp-data', 'iptc-data', 'orientation', 'j
 
 class VipsError extends Error {}
 
+// What the header's field names show, by kind. libvips names EXIF tags by
+// their directory: ifd2 is the camera's EXIF directory, ifd3 the GPS one.
+function metadataKinds(names) {
+  const list = [...names];
+  const kinds = [];
+  if (names.has('exif-data')) kinds.push('exif');
+  if (list.some((name) => name.startsWith('exif-ifd3-'))) kinds.push('gps');
+  if (names.has('exif-ifd2-MakerNote')) kinds.push('makernote');
+  if (names.has('xmp-data')) kinds.push('xmp');
+  if (names.has('iptc-data')) kinds.push('iptc');
+  if (names.has('icc-profile-data')) kinds.push('icc');
+  if (names.has('jpeg-comment') || names.has('gif-comment') || list.some((name) => name.startsWith('png-comment-'))) kinds.push('comment');
+  return kinds;
+}
+
 function toolPath(name, env = process.env) {
   return env.FRAMERINSE_VIPS_DIR ? path.join(env.FRAMERINSE_VIPS_DIR, name) : name;
 }
@@ -109,6 +124,7 @@ async function readSourceHeader(file, workDir) {
   return {
     height: Number(height),
     loader,
+    metadataKinds: metadataKinds(names),
     metadataPresent,
     orientation: Number(orientation) || 1,
     width: Number(width),
