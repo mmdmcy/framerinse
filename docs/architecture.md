@@ -44,5 +44,11 @@ command line (`cli.mjs`) both call them, so a photo cleaned with
 `framerinse clean` goes through exactly what an upload does; the CLI only adds
 its own private work folder and turns pixel covers into normalized ones.
 
+The optional decoy (`src/decoy.js`, off by default) is the one step that adds
+bytes: after rendering, `cleanImage` puts a fixed-size EXIF APP1 segment (Make,
+Model, DateTime, DateTimeOriginal) right after a JPEG's SOI, and both checks
+then expect exactly that: the marker scan only `exif`, the strict walk only
+that segment, compared byte for byte, before the rest of the file.
+
 Under systemd with `Type=notify`, the server runs `systemd-notify --ready` once
 it listens (only when `NOTIFY_SOCKET` is set).

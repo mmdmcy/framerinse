@@ -10,6 +10,7 @@ import { crc32 } from 'node:zlib';
 
 import { createFrameRinseServer, defaultDataDir, parseOptions, publicFiles, securityHeaders } from '../server.mjs';
 import { inspectImageMetadata } from '../src/metadata.js';
+import { decoySegment } from '../src/decoy.js';
 import { verifyCleanImage } from '../src/verify.js';
 
 // Fixtures are made and decoded with the same libvips command line the server uses.
@@ -300,6 +301,39 @@ test('rejects invalid image uploads and unsafe scrub settings', async () => {
       method: 'POST',
     });
     assert.equal(invalidCover.status, 400);
+  });
+});
+
+test('scrubs with the decoy only when asked, JPEG only, and checks its exact bytes', async () => {
+  await withServer(async (baseUrl) => {
+    const created = await createJob(baseUrl);
+    const scrub = (settings) =>
+      fetch(`${baseUrl}/api/jobs/${created.body.id}/scrub`, {
+        body: JSON.stringify({ covers: [], format: 'jpeg', maxEdge: 1080, quality: 90, ...settings }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      });
+
+    const plain = await scrub({});
+    assert.equal(plain.status, 200);
+    assert.equal((await plain.json()).decoy, null);
+
+    const response = await scrub({ decoy: true });
+    assert.equal(response.status, 200);
+    const output = await response.json();
+    assert.equal(output.decoy.Make, 'Apple');
+    assert.equal(output.decoy.Model, 'iPhone 13');
+    const bytes = Buffer.from(await (await fetch(`${baseUrl}${output.outputUrl}`)).arrayBuffer());
+    const day = output.decoy.DateTime.slice(0, 10);
+    assert.equal(verifyCleanImage(bytes, { decoy: decoySegment(day) }).ok, true);
+    assert.deepEqual(verifyCleanImage(bytes).problems, ['exif']);
+    assert.equal(bytes.length, output.size);
+
+    for (const settings of [{ decoy: true, format: 'png' }, { decoy: true, format: 'webp' }, { decoy: 'true' }]) {
+      const refused = await scrub(settings);
+      assert.equal(refused.status, 400, JSON.stringify(settings));
+    }
+    assert.match((await (await scrub({ decoy: true, format: 'png' })).json()).error, /JPEG only/);
   });
 });
 

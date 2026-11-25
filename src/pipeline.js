@@ -2,7 +2,9 @@
 // photo's header, render a clean export, and check the result byte by byte.
 // Every step works on files in a private folder the caller owns.
 
-import { open, readFile } from 'node:fs/promises';
+import { open, readFile, writeFile } from 'node:fs/promises';
+
+import { decoyDay, decoySegment, findDecoy, insertDecoy } from './decoy.js';
 
 import { detectContainer, inspectImageMetadata } from './metadata.js';
 import { verifyCleanImage } from './verify.js';
@@ -81,7 +83,11 @@ function validateScrubSettings(value) {
     }
     return normalized;
   });
-  return { covers, format, maxEdge, quality };
+  // The decoy EXIF is optional and off unless asked for with true.
+  const decoy = value?.decoy ?? false;
+  if (typeof decoy !== 'boolean') throw new InputError(400, 'Decoy must be true or false.');
+  if (decoy && format !== 'jpeg') throw new InputError(400, 'The decoy EXIF is written to JPEG only; choose JPEG or leave the decoy off.');
+  return { covers, decoy, format, maxEdge, quality };
 }
 
 // Reads what the pipeline needs from the source's first bytes and its header,
@@ -131,7 +137,9 @@ async function readSource(sourcePath, workDir) {
 // runs two independent checks on its bytes: the marker scan, and a strict
 // allow-list walk of the whole container that refuses anything not needed to
 // draw the pixels. Throws when either fails; the caller then removes `output`.
-async function cleanImage({ output, settings, source, sourceFormat, sourceHeight, sourceWidth }) {
+// With settings.decoy, the decoy EXIF (src/decoy.js, dated `now`) goes in
+// after SOI, and the checks accept exactly that segment and nothing more.
+async function cleanImage({ now = new Date(), output, settings, source, sourceFormat, sourceHeight, sourceWidth }) {
   const dimensions = outputDimensions(sourceWidth, sourceHeight, settings.maxEdge);
   const outputFormat = OUTPUT_FORMATS[settings.format];
   await renderImage({
@@ -148,12 +156,18 @@ async function cleanImage({ output, settings, source, sourceFormat, sourceHeight
     width: dimensions.width,
   });
 
-  const bytes = await readFile(output);
+  let bytes = await readFile(output);
+  const decoy = settings.decoy ? decoySegment(decoyDay(now)) : undefined;
+  if (decoy) {
+    bytes = insertDecoy(bytes, decoy);
+    await writeFile(output, bytes);
+  }
   const inspection = inspectImageMetadata(bytes, outputFormat.mime, `framerinse.${outputFormat.extension}`);
-  const verified = verifyCleanImage(bytes);
+  const verified = verifyCleanImage(bytes, { decoy });
+  const expectedFindings = decoy ? 'exif' : '';
   if (
     !inspection.fullyChecked ||
-    inspection.hasSensitiveMetadata ||
+    inspection.findings.map((finding) => finding.kind).join() !== expectedFindings ||
     !verified.ok ||
     verified.container !== settings.format ||
     verified.width !== dimensions.width ||
@@ -161,7 +175,7 @@ async function cleanImage({ output, settings, source, sourceFormat, sourceHeight
   ) {
     throw new Error(`Generated output did not pass the metadata check (${verified.problems.join(', ') || 'size or container mismatch'}).`);
   }
-  return { bytes: bytes.length, height: dimensions.height, width: dimensions.width };
+  return { bytes: bytes.length, decoy: decoy ? findDecoy(bytes).fields : null, height: dimensions.height, width: dimensions.width };
 }
 
 const KIND_LABELS = {
@@ -191,6 +205,7 @@ async function inspectFile(filePath, workDir) {
   let fullyChecked = false;
   let width = header.width;
   let height = header.height;
+  let decoy = null;
   if (OUTPUT_FORMATS[container]) {
     const bytes = await readFile(filePath);
     const verified = verifyCleanImage(bytes);
@@ -198,10 +213,19 @@ async function inspectFile(filePath, workDir) {
     fullyChecked = true;
     width ||= verified.width;
     height ||= verified.height;
+    // A file that is clean but for the exact segment `clean --decoy` writes.
+    const written = findDecoy(bytes);
+    if (written && verifyCleanImage(bytes, { decoy: written.segment }).ok) decoy = written.fields;
   } else if (!header.loader) {
     throw new InputError(415, 'Not an image libvips can read.');
   }
   const found = [...new Set(kinds)].map((kind) => ({ kind, label: KIND_LABELS[kind] || kind }));
+  // The decoy is still EXIF and is reported as such, with its fields named.
+  const exif = found.find((item) => item.kind === 'exif');
+  if (decoy && exif) {
+    exif.label = 'EXIF: only the decoy fields that clean --decoy writes';
+    exif.fields = decoy;
+  }
   return { container, found, fullyChecked, height: height || 0, width: width || 0 };
 }
 

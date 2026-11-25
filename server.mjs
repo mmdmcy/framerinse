@@ -419,6 +419,7 @@ async function createFrameRinseServer(options = {}) {
       updateOutputStatement.run(settings.format, output.width, output.height, output.bytes, id);
       sendJson(response, 200, {
         coverCount: settings.covers.length,
+        decoy: output.decoy,
         downloadUrl: `/api/jobs/${id}/output?download=1`,
         expiresAt: job.expires_at,
         format: settings.format,

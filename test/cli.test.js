@@ -235,6 +235,46 @@ test('clean exits 1 and writes nothing when the byte check fails', async () => {
   });
 });
 
+test('clean --decoy writes only the decoy EXIF, and check reports exactly its fields as exif, exit 4', async () => {
+  await withTemp(async (directory) => {
+    const source = await cameraJpeg(directory);
+    const output = path.join(directory, 'decoy.jpg');
+    const run = await framerinse(['clean', source, '-o', output, '--decoy', '--json']);
+    assert.equal(run.code, 0, run.stdout + run.stderr);
+    const result = JSON.parse(run.stdout);
+    assert.deepEqual(Object.keys(result.decoy).sort(), ['DateTime', 'DateTimeOriginal', 'Make', 'Model']);
+    assert.match(result.decoy.DateTimeOriginal, /^\d{4}:\d{2}:\d{2} 12:00:00$/);
+    const bytes = await readFile(output);
+    assert.equal(bytes.includes(Buffer.from('MAKERNTE')), false);
+    assert.equal(bytes.includes(Buffer.from('private comment')), false);
+
+    const json = await framerinse(['check', output, '--json']);
+    assert.equal(json.code, 4);
+    const report = JSON.parse(json.stdout);
+    assert.deepEqual(report.found.map((item) => item.kind), ['exif']);
+    assert.deepEqual(report.found[0].fields, result.decoy);
+    const text = await framerinse(['check', output]);
+    assert.equal(text.code, 4);
+    assert.match(text.stdout, /^  exif +EXIF: only the decoy fields/m);
+    assert.match(text.stdout, /^ +Model: iPhone 13$/m);
+
+    // Off by default: the same command without --decoy gives a file check passes.
+    const plain = path.join(directory, 'no-decoy.jpg');
+    assert.equal((await framerinse(['clean', source, '-o', plain])).code, 0);
+    assert.equal((await framerinse(['check', plain])).code, 0);
+
+    for (const args of [
+      ['clean', source, '-o', path.join(directory, 'x.png'), '--decoy'],
+      ['clean', source, '--format', 'webp', '--decoy'],
+      ['check', output, '--decoy'],
+    ]) {
+      const refused = await framerinse(args);
+      assert.equal(refused.code, 2, args.join(' '));
+    }
+    assert.match((await framerinse(['clean', source, '--format', 'png', '--decoy'])).stderr, /JPEG only/);
+  });
+});
+
 test('tells systemd it is ready only when NOTIFY_SOCKET is set', () => {
   const calls = [];
   const run = (...args) => calls.push(args.slice(0, 2));

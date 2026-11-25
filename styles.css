@@ -499,6 +499,40 @@ main {
   accent-color: var(--ink);
 }
 
+.decoy-field {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 13px 15px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--cream);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.decoy-field input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  accent-color: var(--ink);
+}
+
+.decoy-field strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.decoy-field:has(input:disabled) {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .scrub-row {
   display: flex;
   align-items: center;

@@ -37,7 +37,10 @@ function jpegAppKind(marker, payload) {
   return 'app';
 }
 
-function verifyJpeg(bytes) {
+// decoy: the exact APP1 segment (marker included) the decoy writer made. It
+// must sit right after SOI, byte for byte; every other APPn is still refused,
+// a second EXIF segment too.
+function verifyJpeg(bytes, decoy) {
   const problems = [];
   let width = 0;
   let height = 0;
@@ -45,6 +48,10 @@ function verifyJpeg(bytes) {
   let sawScan = false;
   let sawJfif = false;
   let offset = 2;
+  if (decoy) {
+    if (!bytes.subarray(2, 2 + decoy.length).equals(decoy)) return result('jpeg', ['not the expected decoy EXIF']);
+    offset += decoy.length;
+  }
 
   for (;;) {
     if (offset >= bytes.length) return result('jpeg', ['truncated'], width, height);
@@ -210,10 +217,13 @@ function verifyWebp(bytes) {
 }
 
 // Returns { container, ok, problems, width, height }. ok is true only for a
-// complete JPEG, PNG, or WebP made of allowed structures alone.
-function verifyCleanImage(input) {
+// complete JPEG, PNG, or WebP made of allowed structures alone. With
+// { decoy: segment }, a JPEG must also start with exactly that APP1 segment
+// (src/decoy.js), and any other file fails.
+function verifyCleanImage(input, { decoy } = {}) {
   const bytes = Buffer.isBuffer(input) ? input : Buffer.from(input.buffer, input.byteOffset, input.byteLength);
-  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) return verifyJpeg(bytes);
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) return verifyJpeg(bytes, decoy);
+  if (decoy) return result('unknown', ['the decoy EXIF is for JPEG only']);
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return verifyPng(bytes);
   if (bytes.length >= 12 && ascii(bytes, 0, 4) === 'RIFF' && ascii(bytes, 8, 4) === 'WEBP') return verifyWebp(bytes);
   return result('unknown', ['not a JPEG, PNG, or WebP']);

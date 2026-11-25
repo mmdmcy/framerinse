@@ -14,7 +14,7 @@ const HELP = `framerinse: clean a photo, or check what metadata a file carries.
 
 Usage:
   framerinse clean IN [-o OUT] [--format jpeg|png|webp] [--max-size 1080|2048|4096]
-                      [--quality 65-100] [--cover x,y,w,h]... [--json]
+                      [--quality 65-100] [--cover x,y,w,h]... [--decoy] [--json]
   framerinse check FILE [--json]
 
 clean   Rotates the photo upright, resizes it, paints solid covers, and
@@ -28,10 +28,15 @@ clean   Rotates the photo upright, resizes it, paints solid covers, and
           --quality Q        JPEG and WebP quality, 65 to 100 (default 90)
           --cover x,y,w,h    a solid rectangle in pixels of the upright photo,
                              from its top-left corner; repeat for more (at most 50)
+          --decoy            JPEG only, off by default: add minimal made-up EXIF
+                             (a generic phone's Make and Model, today's date at
+                             noon; no location) instead of none. No metadata at
+                             all, the default, is the recommended choice.
 check   Lists what FILE carries besides its pixels: EXIF, GPS, maker notes,
         XMP, IPTC, ICC profiles, comments, text, timestamps, and anything else
         the strict check refuses (JPEG, PNG, WebP: the same walk an export must
-        pass; other formats: what libvips reads from the header).
+        pass; other formats: what libvips reads from the header). A --decoy
+        output is reported as exif, with the decoy's fields.
 
   --json  machine-readable output, errors too
   -h, --help
@@ -44,6 +49,7 @@ Needs the libvips command line (vips, vipsheader) on PATH, or FRAMERINSE_VIPS_DI
 Examples:
   framerinse clean IMG_0042.HEIC -o share.jpg --cover 120,80,300,60
   framerinse clean scan.png --format webp --max-size 1080 --json
+  framerinse clean IMG_0042.HEIC -o share.jpg --decoy
   framerinse check share.jpg && echo clean
 `;
 
@@ -67,6 +73,7 @@ function parseCommand(argv) {
     args: argv,
     options: {
       cover: { multiple: true, type: 'string' },
+      decoy: { type: 'boolean' },
       format: { type: 'string' },
       help: { short: 'h', type: 'boolean' },
       json: { type: 'boolean' },
@@ -81,7 +88,7 @@ function parseCommand(argv) {
   if (!file) throw new UsageError(`framerinse ${command} needs a file. Run framerinse --help.`);
   if (rest.length) throw new UsageError(`One file at a time; unexpected: ${rest.join(' ')}`);
   if (command === 'check') {
-    const extra = ['cover', 'format', 'max-size', 'output', 'quality'].filter((name) => values[name] !== undefined);
+    const extra = ['cover', 'decoy', 'format', 'max-size', 'output', 'quality'].filter((name) => values[name] !== undefined);
     if (extra.length) throw new UsageError(`framerinse check takes no --${extra[0]}.`);
     return { command, file, json: Boolean(values.json) };
   }
@@ -92,12 +99,14 @@ function parseCommand(argv) {
   if (!MAX_EDGES.includes(maxEdge)) throw new UsageError(`--max-size must be ${MAX_EDGES.join(', ')}.`);
   const quality = Number(values.quality ?? 90);
   if (!Number.isInteger(quality) || quality < 65 || quality > 100) throw new UsageError('--quality must be a whole number from 65 to 100.');
+  const decoy = Boolean(values.decoy);
+  if (decoy && format !== 'jpeg') throw new UsageError('--decoy writes EXIF to JPEG only; use --format jpeg or leave --decoy off.');
   const covers = (values.cover || []).map(parseCover);
   const input = path.resolve(file);
   const parsed = path.parse(input);
   const output = path.resolve(values.output || path.join(parsed.dir, `${parsed.name}-clean.${OUTPUT_FORMATS[format].extension}`));
   if (output === input) throw new UsageError('The output cannot be the input file.');
-  return { command, covers, format, input, json: Boolean(values.json), maxEdge, output, quality };
+  return { command, covers, decoy, format, input, json: Boolean(values.json), maxEdge, output, quality };
 }
 
 // The input is reached through a link named "source" in a private work folder,
@@ -140,6 +149,7 @@ async function clean(options) {
         x: cover.x / info.width,
         y: cover.y / info.height,
       })),
+      decoy: options.decoy,
       format: options.format,
       maxEdge: options.maxEdge,
       quality: options.quality,
@@ -158,6 +168,7 @@ async function clean(options) {
       bytes: result.bytes,
       check: 'passed',
       covers: settings.covers.length,
+      decoy: result.decoy,
       format: options.format,
       height: result.height,
       input: options.input,
@@ -181,7 +192,8 @@ async function check(options) {
 function cleanText(result) {
   const covers = result.covers ? `, ${result.covers} cover${result.covers === 1 ? '' : 's'}` : '';
   const sourceMetadata = { detected: 'metadata removed', 'not-detected': 'no metadata seen in the source', 'not-fully-checked': 'source metadata not fully read; none kept' }[result.source.metadata];
-  return `${result.output}: ${result.format} ${result.width}x${result.height}, ${result.bytes} bytes${covers}; ${sourceMetadata}; byte check passed\n`;
+  const decoy = result.decoy ? `; decoy EXIF added (${result.decoy.Make} ${result.decoy.Model}, ${result.decoy.DateTimeOriginal})` : '';
+  return `${result.output}: ${result.format} ${result.width}x${result.height}, ${result.bytes} bytes${covers}; ${sourceMetadata}${decoy}; byte check passed\n`;
 }
 
 function checkText(report) {
@@ -189,7 +201,8 @@ function checkText(report) {
   const head = `${report.file}: ${report.container}${size}`;
   const scope = report.fullyChecked ? '' : ' (header only: libvips read what it could; this format is not walked byte by byte)';
   if (!report.found.length) return `${head}: nothing found${scope}\n`;
-  return `${head}: found${scope}\n${report.found.map((item) => `  ${item.kind.padEnd(10)} ${item.label}\n`).join('')}`;
+  const fields = (item) => Object.entries(item.fields || {}).map(([name, value]) => `             ${name}: ${value}\n`).join('');
+  return `${head}: found${scope}\n${report.found.map((item) => `  ${item.kind.padEnd(10)} ${item.label}\n${fields(item)}`).join('')}`;
 }
 
 async function main(argv = process.argv.slice(2), out = process.stdout, err = process.stderr) {

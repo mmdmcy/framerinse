@@ -6,6 +6,10 @@ resize, cover details, and re-encode without metadata, then checks the exported
 JPEG, PNG, or WebP itself, byte by byte. SQLite tracks temporary jobs and
 automatic cleanup. It has no npm dependencies: only Node's built-ins and libvips.
 
+Zero metadata is what FrameRinse is for, and the default. An optional decoy
+(below) can add a few made-up EXIF fields to a JPEG instead; it is off unless
+you ask for it.
+
 The phone only decodes a small server-generated preview and the finished image.
 
 ## Run
@@ -51,7 +55,7 @@ node cli.mjs check share.jpg
 
 ```text
 framerinse clean IN [-o OUT] [--format jpeg|png|webp] [--max-size 1080|2048|4096]
-                    [--quality 65-100] [--cover x,y,w,h]... [--json]
+                    [--quality 65-100] [--cover x,y,w,h]... [--decoy] [--json]
 framerinse check FILE [--json]
 ```
 
@@ -61,12 +65,14 @@ framerinse check FILE [--json]
   to `NAME-clean.jpg` next to the input, and an existing file is never
   overwritten. `--format` defaults to the output's extension, else JPEG.
   A cover is `x,y,w,h` in pixels of the upright photo, from its top-left
-  corner; repeat `--cover` for more.
+  corner; repeat `--cover` for more. `--decoy` adds the decoy EXIF (JPEG only;
+  see below).
 - `check` lists what a file carries besides its pixels (EXIF, GPS, maker notes,
   XMP, IPTC, ICC profiles, comments, text, timestamps, and anything else the
   strict check refuses) and exits 4 when it finds any, 0 when none. JPEG, PNG,
   and WebP are walked byte by byte; other formats (HEIC, TIFF, GIF) are read
-  from their libvips header only.
+  from their libvips header only. A decoy output is reported as `exif`, with
+  the decoy's fields, and exits 4: it does carry metadata.
 
 `--json` gives machine output, errors too. Exit codes: 0 done, 1 failed,
 2 usage error, 4 `check` found something. Work files go in a private folder
@@ -135,6 +141,48 @@ of animated inputs.
 - All intermediate files live in the job's own private folder and are removed
   when the step ends.
 
+## The decoy (optional)
+
+Off by default. With **Add a decoy** in the web app, `--decoy` on the command
+line, or `"decoy": true` in the scrub request, a JPEG export gets four EXIF
+fields and nothing else:
+
+- `Make` `Apple` and `Model` `iPhone 13`: one fixed pair for every photo and
+  every user, so it says nothing about your own phone, and two decoy photos
+  cannot be told apart by it. It is a widely sold phone, a few generations old,
+  that is still in common use, so the pair is about as unremarkable as a phone
+  answer gets.
+- `DateTime` and `DateTimeOriginal`: the day of cleaning (the server's local
+  date) at a fixed `12:00:00`. Day precision, not the real time: the real time
+  would record the moment you cleaned the photo to the second, which is the
+  timing trail FrameRinse advises breaking. The fixed noon is itself a tell to
+  anyone who looks closely; that is the price of not recording the time.
+
+Nothing else: no GPS, no maker notes, no serial numbers, no software tag, no
+thumbnail (IFD0 links to no second directory), and no `Orientation` tag, as the
+pixels are already upright and an absent tag means 1. The block is written in
+plain JS (`src/decoy.js`) as an APP1 segment right after the JPEG's start
+marker. The strict check then accepts exactly that segment, compared byte for
+byte with what the writer made, and still refuses everything else, a second
+EXIF segment included. (Readers built on libexif, libvips among them, also list
+mandatory defaults such as `ExifVersion` and the resolution when they read it;
+those are assumed by the reader, not stored in the file.)
+
+PNG and WebP exports refuse the option with a clear error. Phone cameras do not
+write PNG or WebP, so camera EXIF in one would stand out rather than blend in;
+JPEG is where the decoy is plausible.
+
+Why zero metadata stays the default and the decoy only an option:
+
+- A photo with no metadata already blends in. Messengers and most social sites
+  strip EXIF when a photo is shared, so a bare JPEG looks like the many photos
+  that went through one.
+- Fake values can be told apart from real ones. A real phone writes dozens of
+  fields (exposure, lens, software version, sub-second time, maker notes);
+  four fields with a noon timestamp look made up to anyone who checks.
+- A decoy adds a claim (this phone, this day) that may be wrong in a way that
+  matters to you. No metadata makes no claim at all.
+
 ## Checks
 
 ```sh
@@ -143,7 +191,9 @@ npm run check
 ```
 
 The tests need `vips` as above. They cover SQLite job lifecycle, the command
-line (clean, check, and a failed byte check), EXIF
+line (clean, check, and a failed byte check), the decoy (its writer read back,
+the strict check refusing a changed decoy, and decoy off leaving the output
+byte for byte as before), EXIF
 orientation, HEIC input, server previews, solid covers, JPEG/PNG/WebP exports,
 PNG text removal, the pixel limit, the strict output check on hand-made files,
 cleanup, and private-file containment.

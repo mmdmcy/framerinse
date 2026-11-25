@@ -10,6 +10,7 @@ const elements = {
   editorSection: document.querySelector('#editorSection'),
   editorStatus: document.querySelector('#editorStatus'),
   fileInput: document.querySelector('#fileInput'),
+  decoyCheckbox: document.querySelector('#decoyCheckbox'),
   formatSelect: document.querySelector('#formatSelect'),
   inputScan: document.querySelector('#inputScan'),
   maxEdgeSelect: document.querySelector('#maxEdgeSelect'),
@@ -283,7 +284,9 @@ function changeCoverFromKeyboard(event) {
 function outputReport(output) {
   const labels = { jpeg: 'JPEG', png: 'PNG', webp: 'WebP' };
   const reports = [
-    'The server rebuilt the image without known EXIF, GPS, XMP, IPTC, comment, text, or embedded-time blocks.',
+    output.decoy
+      ? `The server rebuilt the image without the original's metadata, then added only the decoy EXIF: ${output.decoy.Make} ${output.decoy.Model}, dated ${output.decoy.DateTimeOriginal}, no location.`
+      : 'The server rebuilt the image without known EXIF, GPS, XMP, IPTC, comment, text, or embedded-time blocks.',
     `Neutral filename “framerinse.${output.format === 'jpeg' ? 'jpg' : output.format}” replaces the source name.`,
     `${labels[output.format]} output: ${output.width} × ${output.height} (${formatBytes(output.size)}).`,
   ];
@@ -372,6 +375,7 @@ async function scrubPhoto() {
     const output = await apiJson(`/api/jobs/${state.jobId}/scrub`, {
       body: JSON.stringify({
         covers: state.covers.map((cover) => ({ ...cover })),
+        decoy: elements.decoyCheckbox.checked && elements.formatSelect.value === 'jpeg',
         format: elements.formatSelect.value,
         maxEdge: Number(elements.maxEdgeSelect.value),
         quality: Number(elements.qualityRange.value),
@@ -425,6 +429,7 @@ async function resetEverything() {
   setBusy(true);
   clearLocalState();
   elements.fileInput.value = '';
+  elements.decoyCheckbox.checked = false;
   await deleteServerJob(jobId);
   setBusy(false);
   setStatus(elements.uploadStatus, 'Temporary server files cleared. Choose another photo when ready.');
@@ -472,8 +477,10 @@ elements.clearCovers.addEventListener('click', () => {
 });
 elements.formatSelect.addEventListener('change', () => {
   elements.qualityField.hidden = elements.formatSelect.value === 'png';
+  elements.decoyCheckbox.disabled = elements.formatSelect.value !== 'jpeg';
   invalidateOutput();
 });
+elements.decoyCheckbox.addEventListener('change', invalidateOutput);
 elements.maxEdgeSelect.addEventListener('change', invalidateOutput);
 elements.qualityRange.addEventListener('input', () => {
   elements.qualityOutput.value = `${elements.qualityRange.value}%`;
