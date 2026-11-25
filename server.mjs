@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
@@ -520,6 +521,18 @@ function printHelp() {
   process.stdout.write(`FrameRinse self-hosted server\n\nUsage: node server.mjs [--host HOST] [--port PORT] [--data-dir PATH] [--max-total-mb MB]\n\nEnvironment:\n  FRAMERINSE_HOST              Bind address (default 0.0.0.0)\n  FRAMERINSE_PORT              Port (default 4173)\n  FRAMERINSE_DATA_DIR          Temporary job/database directory (default $XDG_STATE_HOME/framerinse or ~/.local/state/framerinse)\n  FRAMERINSE_JOB_TTL_MINUTES   Auto-delete delay (default 60)\n  FRAMERINSE_MAX_TOTAL_MB      Cap on stored job bytes before uploads get 507 (default 2048)\n`);
 }
 
+// Under systemd with Type=notify (NOTIFY_SOCKET is set), tell it the server is
+// ready once it listens, through systemd's own tool. systemd-notify waits until
+// systemd has the message, and the unit's NotifyAccess=all lets it send for us.
+// Without NOTIFY_SOCKET (macOS, a plain npm start) nothing happens.
+function notifyReady(env = process.env, run = execFile) {
+  if (!env.NOTIFY_SOCKET) return false;
+  run('systemd-notify', ['--ready'], { timeout: 10_000 }, (error) => {
+    if (error) process.stderr.write(`systemd-notify --ready failed: ${error.message}\n`);
+  });
+  return true;
+}
+
 async function main() {
   const options = parseOptions();
   if (options.help) {
@@ -534,6 +547,7 @@ async function main() {
   app.server.listen(options.port, options.host, () => {
     process.stdout.write(`FrameRinse is available over HTTP on ${options.host}:${options.port}\n`);
     process.stdout.write(`Temporary jobs are stored in ${app.dataDir}\n`);
+    notifyReady();
   });
 
   const shutdown = () => {
@@ -553,4 +567,4 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   });
 }
 
-export { createFrameRinseServer, defaultDataDir, parseOptions, publicFiles, securityHeaders };
+export { createFrameRinseServer, defaultDataDir, notifyReady, parseOptions, publicFiles, securityHeaders };

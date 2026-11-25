@@ -43,3 +43,6 @@ checks), and `inspectFile` (every checker on any file). The server and the
 command line (`cli.mjs`) both call them, so a photo cleaned with
 `framerinse clean` goes through exactly what an upload does; the CLI only adds
 its own private work folder and turns pixel covers into normalized ones.
+
+Under systemd with `Type=notify`, the server runs `systemd-notify --ready` once
+it listens (only when `NOTIFY_SOCKET` is set).

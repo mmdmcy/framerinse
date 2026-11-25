@@ -72,6 +72,21 @@ framerinse check FILE [--json]
 2 usage error, 4 `check` found something. Work files go in a private folder
 under `$TMPDIR` that is removed when the command ends.
 
+## Running under systemd
+
+When `NOTIFY_SOCKET` is set, the server runs `systemd-notify --ready` once it
+listens, so a unit can use systemd's own readiness instead of polling the port:
+
+```ini
+[Service]
+Type=notify
+NotifyAccess=all
+```
+
+`NotifyAccess=all` is needed because the message comes from `systemd-notify`,
+a child of the server. Without `NOTIFY_SOCKET` (macOS, `npm start`) nothing
+happens.
+
 ## Temporary storage
 
 By default, FrameRinse stores its SQLite database and job files under

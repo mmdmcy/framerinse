@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { notifyReady } from '../server.mjs';
 import { verifyCleanImage } from '../src/verify.js';
 
 const cli = fileURLToPath(new URL('../cli.mjs', import.meta.url));
@@ -232,4 +233,13 @@ test('clean exits 1 and writes nothing when the byte check fails', async () => {
     assert.match(JSON.parse(run.stdout).error.message, /did not pass the metadata check \(bytes after the end of the image\)/);
     assert.equal((await readdir(directory)).includes('out.jpg'), false);
   });
+});
+
+test('tells systemd it is ready only when NOTIFY_SOCKET is set', () => {
+  const calls = [];
+  const run = (...args) => calls.push(args.slice(0, 2));
+  assert.equal(notifyReady({}, run), false);
+  assert.deepEqual(calls, []);
+  assert.equal(notifyReady({ NOTIFY_SOCKET: '/run/user/1000/systemd/notify' }, run), true);
+  assert.deepEqual(calls, [['systemd-notify', ['--ready']]]);
 });
