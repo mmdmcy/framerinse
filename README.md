@@ -38,6 +38,55 @@ Choose a photo, add any solid covers, and tap **Scrub photo**. To put the result
 in the iPhone camera roll, tap **Open to save to Photos**, press and hold the
 full image, then choose **Save to Photos**.
 
+## Command line
+
+The same pipeline runs without the server, on a file:
+
+```sh
+node cli.mjs clean IMG_0042.HEIC -o share.jpg --cover 120,80,300,60
+node cli.mjs check share.jpg
+```
+
+`npm link` (or `npm install -g .`) puts it on `PATH` as `framerinse`.
+
+```text
+framerinse clean IN [-o OUT] [--format jpeg|png|webp] [--max-size 1080|2048|4096]
+                    [--quality 65-100] [--cover x,y,w,h]... [--json]
+framerinse check FILE [--json]
+```
+
+- `clean` rotates, resizes, paints solid covers, and re-encodes the photo with
+  the server's own code, then runs the same byte-by-byte check. The file is
+  written only when the check passes; otherwise it exits 1. The output defaults
+  to `NAME-clean.jpg` next to the input, and an existing file is never
+  overwritten. `--format` defaults to the output's extension, else JPEG.
+  A cover is `x,y,w,h` in pixels of the upright photo, from its top-left
+  corner; repeat `--cover` for more.
+- `check` lists what a file carries besides its pixels (EXIF, GPS, maker notes,
+  XMP, IPTC, ICC profiles, comments, text, timestamps, and anything else the
+  strict check refuses) and exits 4 when it finds any, 0 when none. JPEG, PNG,
+  and WebP are walked byte by byte; other formats (HEIC, TIFF, GIF) are read
+  from their libvips header only.
+
+`--json` gives machine output, errors too. Exit codes: 0 done, 1 failed,
+2 usage error, 4 `check` found something. Work files go in a private folder
+under `$TMPDIR` that is removed when the command ends.
+
+## Running under systemd
+
+When `NOTIFY_SOCKET` is set, the server runs `systemd-notify --ready` once it
+listens, so a unit can use systemd's own readiness instead of polling the port:
+
+```ini
+[Service]
+Type=notify
+NotifyAccess=all
+```
+
+`NotifyAccess=all` is needed because the message comes from `systemd-notify`,
+a child of the server. Without `NOTIFY_SOCKET` (macOS, `npm start`) nothing
+happens.
+
 ## Temporary storage
 
 By default, FrameRinse stores its SQLite database and job files under
@@ -93,7 +142,8 @@ npm test
 npm run check
 ```
 
-The tests need `vips` as above. They cover SQLite job lifecycle, EXIF
+The tests need `vips` as above. They cover SQLite job lifecycle, the command
+line (clean, check, and a failed byte check), EXIF
 orientation, HEIC input, server previews, solid covers, JPEG/PNG/WebP exports,
 PNG text removal, the pixel limit, the strict output check on hand-made files,
 cleanup, and private-file containment.

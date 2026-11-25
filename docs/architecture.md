@@ -36,3 +36,13 @@ metadata at all, and it is also told to keep none. `src/metadata.js` then checks
 the final container for known EXIF, XMP, IPTC, comment, text, and embedded-time
 structures, and `src/verify.js` walks it completely, accepting only what is
 needed to draw the pixels, before the output route is enabled.
+
+The cleaning steps themselves live in `src/pipeline.js`: `readSource` (format,
+upright size, metadata seen, the pixel limit), `cleanImage` (render, then both
+checks), and `inspectFile` (every checker on any file). The server and the
+command line (`cli.mjs`) both call them, so a photo cleaned with
+`framerinse clean` goes through exactly what an upload does; the CLI only adds
+its own private work folder and turns pixel covers into normalized ones.
+
+Under systemd with `Type=notify`, the server runs `systemd-notify --ready` once
+it listens (only when `NOTIFY_SOCKET` is set).
